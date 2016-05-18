@@ -8,11 +8,11 @@
 
 @summary: Class to manage IONEX files.
 
-@version: 0.1
-@change: Initial version
+@version: 1.0
+@change: Improved runtime by using cStringIO
 
-@todo:  - Only basic writer is present, reader still pending
-        - Writer doesn't check if input data extends over current day
+@todo:  - Writer doesn't check if input data extends over current day
+        - Writer doesn't process aux data
 @bug: 
 
 '''
@@ -20,10 +20,17 @@
 import datetime
 import os
 import numpy as np
+from collections import namedtuple
+import logging
+import cStringIO
+try:
+    from enum import Enum
+except:
+    raise ImportError("Please install enum34")
 
-IONEX_HEADER =  "     1.0            IONOSPHERE MAPS     GPS                 IONEX VERSION / TYPE\n" + \
+IONEX_HEADER = "     1.0            IONOSPHERE MAPS     GPS                 IONEX VERSION / TYPE\n" + \
                 "{program_name:20s}{agency_name:20s}{map_date:20s}PGM / RUN BY / DATE\n" + \
-                "{description}\n" + \
+                "{description}" + \
                 "{year_start:6d}{month_start:6d}{day_start:6d}{hour_start:6d}{minute_start:6d}{second_start:6d}" + 24 * " " + "EPOCH OF FIRST MAP\n" + \
                 "{year_end:6d}{month_end:6d}{day_end:6d}{hour_end:6d}{minute_end:6d}{second_end:6d}" + 24 * " " + "EPOCH OF LAST MAP\n" + \
                 "{map_sec_interval:6d}" + 54 * " " + "INTERVAL\n" + \
@@ -39,11 +46,11 @@ IONEX_HEADER =  "     1.0            IONOSPHERE MAPS     GPS                 ION
                 "  {lat1:6.1f}{lat2:6.1f}{dlat:6.1f}" + 40 * " " + "LAT1 / LAT2 / DLAT\n" + \
                 "  {lon1:6.1f}{lon2:6.1f}{dlon:6.1f}" + 40 * " " + "LON1 / LON2 / DLON\n" + \
                 "{exponent:6d}" + 54 * " " + "EXPONENT\n" + \
-                "{comment}\n" + \
+                "{comment}" + \
                 "                                                            END OF HEADER\n"
 
-DESCRIPTION_FORMAT = "{:60s}DESCRIPTION"
-COMMENT_FORMATA = "{:60s}COMMENT"
+DESCRIPTION_FORMAT = "{:60s}DESCRIPTION\n"
+COMMENT_FORMAT = "{:60s}COMMENT\n"
 
 TEC_START_FORMAT = "{:6d}" + 54 * " " + "START OF TEC MAP\n"
 RMS_START_FORMAT = "{:6d}" + 54 * " " + "START OF RMS MAP\n"
@@ -66,9 +73,8 @@ MAP_DATE_FORMAT = "%d-%b-%Y %H:%M"
 
 class IonexWriter(object):
     '''
-    Ionex processer class. 
+    Ionex writer class. 
     '''
-
     def __init__(self, map_sec_interval, file_name=None, analysis_center="upc",
                  extension="g", file_sequence="0",
                  program_name="ionex.py", agency_name="UPC-IonSAT", map_date=None,
@@ -159,7 +165,7 @@ class IonexWriter(object):
                     "map_date set with incorrect value, needs to be string or datetime.datetime instance.")
 
         if description is not None and len(description) > 60:
-            print(
+            logging.warn(
                 "Description longer than 60 characters. It's the user responsibility to take care of formating or use add_description instead")
         if description is None:
             self.description = DESCRIPTION_FORMAT.format("")
@@ -167,10 +173,10 @@ class IonexWriter(object):
             self.description = description
 
         if comment is not None and len(comment) > 60:
-            print(
+            logging.warn(
                 "Comment longer than 60 characters. It's the user responsibility to take care of formating or use add_comment instead")
-        if description is None:
-            self.comment = DESCRIPTION_FORMAT.format("")
+        if comment is None:
+            self.comment = COMMENT_FORMAT.format("")
         else:
             self.comment = comment
 
@@ -257,11 +263,15 @@ class IonexWriter(object):
         self.lon2 = lon2
         self.dlon = dlon
 
-        self.tec_values_len = ((self.lon2 - self.lon1) // self.dlon) + 1
-        self.tec_lat_entries = ((self.lat2 - self.lat1) // self.dlat) + 1
+        self.maps_values_len = ((self.lon2 - self.lon1) // self.dlon) + 1
+        # self.maps_lat_entries = ((self.lat2 - self.lat1) // self.dlat) + 1
         self.tec_lat_cnt = 0
         self.tec_next_lat = self.lat1
         self.next_tec_date = None
+        
+        self.rms_lat_cnt = 0
+        self.rms_next_lat = self.lat1
+        self.next_rms_date = None
 
         self.exponent = exponent
 
@@ -271,7 +281,7 @@ class IonexWriter(object):
             self.file_name = file_name
 
         self.maps_in_file = 0
-        self.expected_tec_maps_in_file = 1 + \
+        self.expected_maps_in_file = 1 + \
             ((self.date_end - self.date_start).seconds / self.map_sec_interval)
         self.tec_string = None
         self.tec_map_cnt = 0
@@ -282,33 +292,52 @@ class IonexWriter(object):
 
         for key, value in kwargs.items():
             setattr(self, key, value)
+            
+        self.tec_map_closed = False
+        self.rms_map_closed = False
 
     def __str__(self):
         self.maps_in_file = self.tec_map_cnt
-        self.string = ""
-        self.string += IONEX_HEADER.format(**self.__dict__)
+        string_list = [IONEX_HEADER.format(**self.__dict__)]
         if self.tec_string is not None:
-            self.string += self.tec_string
+            if not self.tec_map_closed:
+                self.tec_map_closed = True
+                self.tec_string.write(TEC_END_FORMAT.format(self.tec_map_cnt))
+            string_list.append(self.tec_string.getvalue())
         if self.rms_string is not None:
-            self.string += self.rms_string
+            if not self.rms_map_closed:
+                self.rms_map_closed = True
+                self.rms_string.write(RMS_END_FORMAT.format(self.rms_map_cnt))
+            string_list.append(self.rms_string.getvalue())
         if self.hgt_string is not None:
-            self.string += self.hgt_string
-        self.string += LAST_LINE
+            string_list.append(self.hgt_string.getvalue())
+        string_list.append(LAST_LINE)
+        self.string = ''.join(string_list)
         return self.string
 
-    def add_description(self, string):
+    def set_description(self, string_list):
         '''
         Format string to ionex description
-        TODO: Implement add_description
         '''
-        raise NotImplementedError
+        self.description = ""
+        for line in string_list:
+            if len(line) > 60:
+                raise AttributeError("Lines need to be of length less than 60")
+            else:
+                self.description += DESCRIPTION_FORMAT.format(line)
+        self.description = self.description
 
-    def add_comment(self, string):
+    def set_comment(self, string_list):
         '''
         Format string to ionex comment
-        TODO: Implement add_comment
         '''
-        raise NotImplementedError
+        self.comment = ""
+        for line in string_list:
+            if len(line) > 60:
+                raise AttributeError("Lines need to be of length less than 60")
+            else:
+                self.comment += COMMENT_FORMAT.format(line)
+        self.comment = self.comment
 
     def set_file_path(self, file_path):
         '''
@@ -319,7 +348,7 @@ class IonexWriter(object):
                                             extension=self.extension,
                                             doy_start=self.doy_start,
                                             file_sequence=self.file_sequence,
-                                            year_2d=self.date_start.strftime("%y")).upper()
+                                            year_2d=self.date_start.strftime("%y")).lower()
         self.file_name = os.path.join(os.path.normpath(file_path), file_name)
 
     def write_file(self):
@@ -339,32 +368,69 @@ class IonexWriter(object):
         else:
             self.next_tec_date += datetime.timedelta(seconds=self.map_sec_interval)
         if date != self.next_tec_date:
-            print("Error, current date to be set is %s and external date given is %s" %
+            logging.warn("Current date to be set is %s and expected date is %s" % 
                   (date, self.next_tec_date))
+        self.next_tec_date = date
         self._tec_map_entry_epoch(self.next_tec_date)
+        
+    def change_next_rms_epoch(self, date=None):
+        '''
+        Change to the next RMS epoch. If date is set, check that the next epoch
+        set is the same than date. 
+        '''
+        if self.next_rms_date is None:
+            self.next_rms_date = self.date_start
+        else:
+            self.next_rms_date += datetime.timedelta(seconds=self.map_sec_interval)
+        if date != self.next_rms_date:
+            logging.warn("Error, current date to be set is %s and expected date is %s" % 
+                  (date, self.next_rms_date))
+        self._rms_map_entry_epoch(self.next_rms_date)
 
     def _tec_map_entry_epoch(self, date):
         '''
         Change TEC epoch of current map
         '''
         if type(date) != datetime.datetime:
-            print("Error, date needs to be of type datetime.datetime")
-            return
+            raise TypeError("Error, date needs to be of type datetime.datetime")
         if self.tec_string is None:
-            self.tec_string = ""
+            self.tec_string = cStringIO.StringIO()
         else:
             if (self.lat2 + self.dlat != self.tec_next_lat):
                 raise RuntimeError(
                     "Number of lat entries written and expect don't match")
             self.tec_next_lat = self.lat1
-            self.tec_string += TEC_END_FORMAT.format(self.tec_map_cnt)
+            self.tec_string.write(TEC_END_FORMAT.format(self.tec_map_cnt))
         self.tec_map_cnt += 1
-        self.tec_string += TEC_START_FORMAT.format(self.tec_map_cnt)
-        self.tec_string += EPOCH_FORMAT.format(year=date.year, month=date.month,
+        self.tec_string.write(TEC_START_FORMAT.format(self.tec_map_cnt))
+        self.tec_string.write(EPOCH_FORMAT.format(year=date.year, month=date.month,
                                                day=date.day, hour=date.hour,
                                                minute=date.minute,
-                                               second=date.second)
-    
+                                               second=date.second))
+        self.tec_map_closed = False
+
+    def _rms_map_entry_epoch(self, date):
+        '''
+        Change RMS epoch of current map
+        '''
+        if type(date) != datetime.datetime:
+            raise TypeError("Error, date needs to be of type datetime.datetime")
+        if self.rms_string is None:
+            self.rms_string = cStringIO.StringIO()
+        else:
+            if (self.lat2 + self.dlat != self.rms_next_lat):
+                raise RuntimeError(
+                    "Number of lat entries written and expect don't match")
+            self.rms_next_lat = self.lat1
+            self.rms_string.write(RMS_END_FORMAT.format(self.rms_map_cnt))
+        self.rms_map_cnt += 1
+        self.rms_string.write(RMS_START_FORMAT.format(self.rms_map_cnt))
+        self.rms_string.write(EPOCH_FORMAT.format(year=date.year, month=date.month,
+                                               day=date.day, hour=date.hour,
+                                               minute=date.minute,
+                                               second=date.second))
+        self.rms_map_closed = False    
+
     def add_tec_entry(self, tec_array, lat_vec, date=None):
         '''
         Change to the next TEC epoch and set all the TEC entries.
@@ -372,55 +438,427 @@ class IonexWriter(object):
         self.change_next_tec_epoch(date)
         for i, entry in enumerate(tec_array):
             self.add_tec_lat_entry(lat_vec[i], entry)
-            #self._add_tec_entry(tec_array)
+            # self._add_tec_entry(tec_array)
         return self.close_tec()
+    
+    def add_rms_entry(self, rms_array, lat_vec, date=None):
+        '''
+        Change to the next RMS epoch and set all the RMS entries.
+        '''
+        self.change_next_rms_epoch(date)
+        for i, entry in enumerate(rms_array):
+            self.add_rms_lat_entry(lat_vec[i], entry)
+        return self.close_rms()
 
     def add_tec_lat_entry(self, lat, tec_array):
         '''
-        Add next TEC latitude entry for current map. Returns true if all maps for
-        all the epochs have been written. 
+        Add next TEC latitude entry for current map. 
         '''
         if type(tec_array) is not np.ndarray:
-            print("tec_array must be of type numpy.ndarray")
-        if len(tec_array) != self.tec_values_len:
-            print("Error, tec array length needs to be %d and it was %d." %
-                  (self.tec_values_len, len(tec_array)))
-            return
+            raise TypeError("tec_array must be of type numpy.ndarray")
+        if len(tec_array) != self.maps_values_len:
+            raise ValueError("Error, tec array length needs to be %d and it was %d." % 
+                  (self.maps_values_len, len(tec_array)))
         if lat != self.tec_next_lat:
-            print("Error, got tec entry for lat %d, expected for lat %d" %
+            logging.warn("Got tec entry for lat %d, expected for lat %d" % 
                   (lat, self.tec_next_lat))
         self._add_tec_entry(tec_array)
-        return self.close_tec()
+
+    def add_rms_lat_entry(self, lat, rms_array):
+        '''
+        Add next RMS latitude entry for current map.
+        '''
+        if type(rms_array) is not np.ndarray:
+            raise TypeError("rms_array must be of type numpy.ndarray")
+        if len(rms_array) != self.maps_values_len:
+            raise ValueError("Error, rms array length needs to be %d and it was %d." % 
+                  (self._values_len, len(rms_array)))
+        if lat != self.rms_next_lat:
+            logging.warn("Got rms entry for lat %d, expected for lat %d" % 
+                  (lat, self.rms_next_lat))
+        self._add_rms_entry(rms_array)
 
     def _add_tec_entry(self, tec_array):
         '''
         Add next TEC latitude entry for current map
         '''
-        self.tec_string += INIT_TEC_RMS_FORMAT.format(lat = self.tec_next_lat,
-                                                      lon1 = self.lon1, 
-                                                      lon2 = self.lon2,
-                                                      dlon = self.dlon,
-                                                      h = self.h)
+        self.tec_string.write(INIT_TEC_RMS_FORMAT.format(lat=self.tec_next_lat,
+                                                      lon1=self.lon1,
+                                                      lon2=self.lon2,
+                                                      dlon=self.dlon,
+                                                      h=self.h))
         self.tec_next_lat += self.dlat
-        tec_array = np.around(tec_array * 10**np.abs(self.exponent)) 
-        stop = 16
-        for start in range(0, tec_array.size, stop):
+        tec_array = (tec_array * 10 ** np.abs(self.exponent)).astype('int', copy=False)
+        stop = 16 
+        for start in range(0, tec_array.size, 16):
             sub_arr = tec_array[start:stop]
-            for item in sub_arr:
-                self.tec_string += (DATA_FORMAT).format(int(item))
-            self.tec_string += "\n"
-            stop += 16 
+            self.tec_string.write((sub_arr.size * DATA_FORMAT + "\n").format(*sub_arr))
+            stop += 16
+
+    def _add_rms_entry(self, rms_array):
+        '''
+        Add next TEC latitude entry for current map
+        '''
+        self.rms_string.write(INIT_TEC_RMS_FORMAT.format(lat=self.rms_next_lat,
+                                                      lon1=self.lon1,
+                                                      lon2=self.lon2,
+                                                      dlon=self.dlon,
+                                                      h=self.h))
+        self.rms_next_lat += self.dlat
+        rms_array = (rms_array * 10 ** np.abs(self.exponent)).astype('int', copy=False)
+        stop = 16 
+        for start in range(0, rms_array.size, 16):
+            sub_arr = rms_array[start:stop]
+            self.rms_string.write((sub_arr.size * DATA_FORMAT + "\n").format(*sub_arr))
+            stop += 16
 
     def close_tec(self):
         '''
         Returns true and close last tec map if all maps for all the epochs have been written. 
         '''
-        if (self.lat2 != self.tec_next_lat and self.next_tec_date == self.date_end):
-            self.tec_string += TEC_END_FORMAT.format(self.tec_map_cnt)
-            if self.tec_map_cnt != self.expected_tec_maps_in_file:
-                raise RuntimeError("Expected number of TEC maps was %d, number of TEC maps written is %d" %
-                                   (self.expected_tec_maps_in_file, self.expected_tec_maps_in_file))
+        if (self.lat2 == (self.tec_next_lat - self.dlat)):
+            self.tec_string.write(TEC_END_FORMAT.format(self.tec_map_cnt))
+            self.tec_map_closed = True
+            if (self.next_tec_date >= self.date_end and
+                self.tec_map_cnt != self.expected_maps_in_file):
+                    logging.error("Expected number of TEC maps was %d, number of TEC maps written is %d" % 
+                                  (self.expected_maps_in_file, self.tec_map_cnt))
             return True
-        else:
-            return False
+        return False
         
+    def close_rms(self):
+        '''
+        Returns true and close last RMS map if all maps for all the epochs have been written. 
+        '''
+        if (self.lat2 == (self.rms_next_lat - self.dlat)):
+            self.rms_string.write(RMS_END_FORMAT.format(self.rms_map_cnt))
+            self.rms_map_closed = True
+            if (self.next_tec_date >= self.date_end and
+                self.rms_map_cnt != self.expected_maps_in_file):
+                    logging.error("Expected number of RMS maps was %d, number of RMS maps written is %d" % 
+                                  (self.expected_maps_in_file, self.rms_map_cnt))
+            return True
+        return False
+        
+_ionex_header_fields = namedtuple('_ionex_header_fields', ['version',
+                                                           'type',
+                                                           'satellite_system',
+                                                           'program_name',
+                                                           'agency',
+                                                           'creation_date',
+                                                           'description',
+                                                           'comment',
+                                                           'epoch_first_map',
+                                                           'epoch_last_map',
+                                                           'interval',
+                                                           'n_maps',
+                                                           'mapping',
+                                                           'ele_cutoff',
+                                                           'obs_used',
+                                                           'n_stations',
+                                                           'n_satellites',
+                                                           'earth_radius',
+                                                           'map_dim',
+                                                           'hgt1', 'hgt2', 'dhgt',
+                                                           'lat1', 'lat2', 'dlat',
+                                                           'lon1', 'lon2', 'dlon',
+                                                           'exponent', 'aux_data'                                                        
+                                                           ])
+
+_map = namedtuple('_map', 'id epoch value')
+
+_fsm_reader = Enum('_fsm_reader', 'header map_type read_map')
+_entry_type = Enum('_entry_type', 'tec rms hgt')
+
+def_header_dict = {'version': 1.0,
+                   'type': 'I',
+                   'satellite_system': 'GPS',
+                   'program_name': None,
+                   'agency': None,
+                   # Standard doesn't define the date format
+                   # 'creation_date': datetime.datetime.now(),
+                   'creation_date': '',
+                   'description': None,
+                   'comment': None,
+                   'epoch_first_map': datetime.datetime.now(),
+                   'epoch_last_map': datetime.datetime.now(),
+                   'interval': 900,
+                   'n_maps': 97,
+                   'mapping': 'COSZ',
+                   'ele_cutoff': 0.0,
+                   'obs_used': '',
+                   'n_stations': 0,
+                   'n_satellites': 0,
+                   'earth_radius': 6371.0,
+                   'map_dim': 2,
+                   'hgt1': 400.0, 'hgt2': 400.0, 'dhgt': 0.0,
+                   'lat1':-87.5, 'lat2':87.5, 'dlat':2.5,
+                   'lon1':-180.0, 'lon2':180.0, 'dlon':5.0,
+                   'exponent':-1,
+                   'aux_data': None}
+
+class IonexReader(object):
+    '''
+    Ionex reader class
+    '''
+    def __init__(self, file_path, strict_mode=False,
+                 header_dict=def_header_dict):
+        '''
+        :file_path: path to the ionex file to read
+        :strict_mode: error if not complaint with the standard
+        '''
+        state = _fsm_reader.header
+        header_fields_cnt = 0
+        if not strict_mode:
+            exp_len_map_entry = int((header_dict['lon2'] - 
+                                     header_dict['lon1']) / 
+                                     header_dict['dlon']) + 1
+        aux_data = False
+        self.tec_maps = []
+        self.rms_maps = []
+        self.hgt_maps = []
+        self.tec_map_next_cnt = 0
+        self.rms_map_next_cnt = 0
+        self.hgt_map_next_cnt = 0
+        with open(file_path, 'r') as f:
+            for line in f:
+                line_type = line[60:]
+                if state == _fsm_reader.header:
+                    # Using in allows ignoring whitespaces before end of line and 
+                    #  header displaced outside expected position
+                    if aux_data:
+                        if "END OF AUX DATA" in line_type:
+                            aux_data = False
+                        else:
+                            header_dict['aux_data'].append(line) 
+                    elif "IONEX VERSION / TYPE" in line_type: 
+                        header_dict['version'] = float(line[:8])
+                        header_dict['type'] = line[20:21]
+                        header_dict['satellite_system'] = line[40:43]
+                        header_fields_cnt += 1
+                    elif "PGM / RUN BY / DATE" in line_type:
+                        header_dict['program_name'] = line[:20]
+                        header_dict['agency'] = line[20:40]
+                        header_dict['creation_date'] = line[40:60]
+                        header_fields_cnt += 1
+                    elif "DESCRIPTION" in line_type:
+                        if header_dict['description'] is None:
+                            header_dict['description'] = [line[:60]]
+                        else:
+                            header_dict['description'].append(line[:60])
+                    elif "COMMENT" in line_type:
+                        if header_dict['comment'] is None:
+                            header_dict['comment'] = [line[:60]]
+                        else:
+                            header_dict['comment'].append(line[:60])
+                    elif "EPOCH OF FIRST MAP" in line_type:
+                        ll = line[:60].split()
+                        header_dict['epoch_first_map'] = datetime.datetime(year=int(ll[0]), \
+                                                                           month=int(ll[1]), \
+                                                                           day=int(ll[2]), \
+                                                                           hour=int(ll[3]), \
+                                                                           minute=int(ll[4]), \
+                                                                           second=int(ll[5]))
+                        header_fields_cnt += 1
+                    elif "EPOCH OF LAST MAP" in line_type:
+                        ll = line[:60].split()
+                        header_dict['epoch_last_map'] = datetime.datetime(year=int(ll[0]), \
+                                                                           month=int(ll[1]), \
+                                                                           day=int(ll[2]), \
+                                                                           hour=int(ll[3]), \
+                                                                           minute=int(ll[4]), \
+                                                                           second=int(ll[5]))
+                        header_fields_cnt += 1
+                    elif "INTERVAL" in line_type:
+                        header_dict['interval'] = int(line[:6])
+                        header_fields_cnt += 1
+                    elif "# OF MAPS IN FILE" in line_type:
+                        header_dict['n_maps'] = int(line[:6])
+                        header_fields_cnt += 1
+                    elif "MAPPING FUNCTION" in line_type:
+                        header_dict['mapping'] = line[2:6]
+                        header_fields_cnt += 1
+                    elif "ELEVATION CUTOFF" in line_type:
+                        header_dict['ele_cutoff'] = float(line[:8])
+                        header_fields_cnt += 1
+                    elif "OBSERVABLES USED" in line_type:
+                        header_dict['obs_used'] = line[:60]
+                        header_fields_cnt += 1
+                    elif "# OF STATIONS" in line_type:
+                        header_dict['n_stations'] = int(line[:6])
+                    elif "# OF SATELLITES" in line_type:
+                        header_dict['n_satellites'] = int(line[:6])
+                    elif "BASE RADIUS" in line_type:
+                        header_dict['earth_radius'] = float(line[:8])
+                        header_fields_cnt += 1
+                    elif "MAP DIMENSION" in line_type:
+                        header_dict['map_dim'] = int(line[:6])
+                        header_fields_cnt += 1
+                    elif "HGT1 / HGT2 / DHGT" in line_type:
+                        header_dict['hgt1'] = float(line[2:8])
+                        header_dict['hgt2'] = float(line[8:14])
+                        header_dict['dhgt'] = float(line[14:20])
+                        header_fields_cnt += 1
+                    elif "LAT1 / LAT2 / DLAT" in line_type:
+                        header_dict['lat1'] = float(line[2:8])
+                        header_dict['lat2'] = float(line[8:14])
+                        header_dict['dlat'] = float(line[14:20])
+                        header_fields_cnt += 1
+                    elif "LON1 / LON2 / DLON" in line_type:
+                        header_dict['lon1'] = float(line[2:8])
+                        header_dict['lon2'] = float(line[8:14])
+                        header_dict['dlon'] = float(line[14:20])
+                        header_fields_cnt += 1   
+                        exp_len_map_entry = int((header_dict['lon2'] - 
+                                                 header_dict['lon1']) / 
+                                                 header_dict['dlon']) + 1
+                    elif "EXPONENT" in line_type:
+                        if strict_mode:
+                            header_dict['exponent'] = int(line[:6])
+                        else:
+                            header_dict['exponent'] = int(line[:60])
+                    elif "START OF AUX DATA" in line_type:
+                        aux_data = True
+                        header_dict['aux_data'] = []
+                    elif "END OF HEADER" in line_type:
+                        self.header = _ionex_header_fields(**header_dict)
+                        header_dict = None
+                        state = _fsm_reader.map_type
+                        if strict_mode:
+                            assert header_fields_cnt >= 14, \
+                                "Missing some required IONEX fields"
+                        elif header_fields_cnt < 14:
+                            logging.warn("Missing some required IONEX fields")
+                    else:
+                        logging.error("Unknown type of ionex header entry:\n%s" % line[:-1])
+                elif state == _fsm_reader.map_type:
+                    entry = {'id': int(line[:6])}
+                    state = _fsm_reader.read_map
+                    line_cnt = 0
+                    if "START OF TEC MAP" in line_type:
+                        entry_type = _entry_type.tec
+                    elif "START OF RMS MAP" in line_type:
+                        entry_type = _entry_type.rms
+                    elif "START OF HEIGHT MAP" in line_type:
+                        entry_type = _entry_type.hgt
+                    elif "END OF FILE" in line_type:
+                        logging.debug("Reached end of file")
+                    else:
+                        raise RuntimeError("Unknown type of map\n%s" % line[:-1])
+                elif state == _fsm_reader.read_map:
+                    if "EPOCH OF CURRENT MAP" in line_type:
+                        assert line_cnt == 0, "Unexpected position of epoch"
+                        line_cnt += 1
+                        ll = line[:60].split()
+                        hour = int(ll[3])
+                        if hour == 24:
+                            hour = 23
+                            minute = 59
+                            second = 59
+                        else:
+                            minute = int(ll[4])
+                            second = int(float(ll[5]))
+                        entry['epoch'] = datetime.datetime(year=int(ll[0]), \
+                                                           month=int(ll[1]), \
+                                                           day=int(ll[2]), \
+                                                           hour=hour, \
+                                                           minute=minute, \
+                                                           second=second)  
+                        lat_cnt = 0
+                        entry['value'] = []
+                        c_values = []
+                    elif "LAT/LON1/LON2/DLON/H" in line_type:
+                        c_lat = float(line[2:8])
+                        c_lon1 = float(line[8:14])
+                        c_lon2 = float(line[14:20])
+                        c_dlon = float(line[20:26])
+                        c_h = float(line[26:32])
+                        assert line_cnt == 1, "Unexpected position of lat/lon/..."
+                        assert c_lat == self.header.lat1 + lat_cnt * self.header.dlat, \
+                          ("Expected lat %f, found %f" % 
+                           (c_lat, self.header.lat1 + lat_cnt * self.header.dlat))
+                        assert c_lon1 == self.header.lon1, "lon1 error"
+                        assert c_lon2 == self.header.lon2, "lon2 error"
+                        assert c_dlon == self.header.dlon, "dlon error"
+                        # TODO: Currently only 2-d maps are accepted
+                        assert c_h == self.header.hgt1, "height error"
+                        if lat_cnt != 0:
+                            assert len(c_values) == exp_len_map_entry, \
+                                ("Expected %d values, found %d" % \
+                                 (len(c_values), exp_len_map_entry))
+                            entry['value'].append(np.array(c_values) * 
+                                              10 ** self.header.exponent)
+                            c_values = []
+                        lat_cnt += 1
+                    elif "END OF TEC MAP" in line_type:
+                        assert entry['id'] == int(line[:6]), \
+                            "End of TEC map ID doesn't match"
+                        assert c_lat == self.header.lat2, \
+                            "Missing some lat values for current map"
+                        assert entry_type == _entry_type.tec, \
+                            "End of tec map found, expected another kind of map"
+                        assert len(c_values) == exp_len_map_entry, \
+                                ("Expected %d values, found %d" % \
+                                 (len(c_values), exp_len_map_entry))
+                        entry['value'].append(np.array(c_values) * 
+                                              10 ** self.header.exponent)
+                        self.tec_maps.append(_map(**entry))
+                        state = _fsm_reader.map_type
+                    elif "END OF RMS MAP" in line_type:
+                        assert entry['id'] == int(line[:6]), \
+                            "End of RMS map ID doesn't match"
+                        assert c_lat == self.header.lat2, \
+                            "Missing some lat values for current map"
+                        assert entry_type == _entry_type.rms, \
+                            "End of RMS map found, expected another kind of map"
+                        assert len(c_values) == exp_len_map_entry, \
+                                ("Expected %d values, found %d" % \
+                                 (len(c_values), exp_len_map_entry))
+                        entry['value'].append(np.array(c_values) * 
+                                              10 ** self.header.exponent)
+                        self.rms_maps.append(_map(**entry))
+                        state = _fsm_reader.map_type
+                    elif "END OF HGT MAP" in line_type:
+                        assert entry['id'] == int(line[:6]), \
+                            "End of HGT map ID doesn't match"
+                        assert c_lat == self.header.lat2, \
+                            "Missing some lat values for current map"
+                        assert entry_type == _entry_type.hgt, \
+                            "End of hgt map found, expected another kind of map"
+                        assert len(c_values) == exp_len_map_entry, \
+                                ("Expected %d values, found %d" % \
+                                 (len(c_values), exp_len_map_entry))
+                        entry['value'].append(np.array(c_values) * 
+                                              10 ** self.header.exponent)
+                        self.hgt_maps.append(_map(**entry))
+                        state = _fsm_reader.map_type
+                    else:
+                        prev_pos = 0
+                        for cur_pos in range(5, len(line) + 1, 5):
+                            c_values.append(int(line[prev_pos:cur_pos]))
+                            prev_pos = cur_pos
+        if strict_mode:
+            assert self.header.n_maps == len(self.tec_maps), \
+                ("Expected number of maps (%d) and maps read (%d) doesn't match" % \
+                  (self.header.n_maps, len(self.tec_maps)))
+        else:
+            if self.header.n_maps != len(self.tec_maps):
+                logging.warn("Expected number of maps (%d) and maps read (%d) doesn't match" % \
+                  (self.header.n_maps, len(self.tec_maps)))
+                
+    def get_header(self):
+        return self.header
+    
+    def get_tec_maps(self):
+        return self.tec_maps
+    
+    def get_next_tec_map(self):
+        self.tec_map_next_cnt += 1
+        return self.tec_maps[self.tec_map_next_cnt - 1]
+    
+    def set_next_tec_map_cnt(self, prm):
+        if prm > len(self.tec_maps):
+            raise ValueError("tec_map_cnt needs to be lower than %d" % 
+                             len(self.tec_maps))
+        else:
+            self.tec_map_next_cnt = prm
